@@ -1,0 +1,435 @@
+name: Build CMake & Cling (Android ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: Android minimum API level
+        required: true
+        default: '30'
+        type: choice
+        options: ['29', '30', '31', '32', '33', '34', '35', '36']
+      cling_ref:
+        description: Cling git ref in root-project/cling (default v1.3, or 'latest' / branch)
+        required: true
+        default: 'v1.3'
+        type: string
+      llvm_ref:
+        description: LLVM git ref in root-project/llvm-project matching Cling
+        required: true
+        default: 'cling-llvm20-20260119-01'
+        type: string
+      cmake_version:
+        description: CMake version to build (default 4.5.1, or 'latest')
+        required: true
+        default: '4.5.1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cling-cmake-only-android-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-cling-and-cmake:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      NDK_VERSION: 30.0.16248370
+      NDK_SHA1: 5107f898313790e449e87eee2183d9a20602dee9
+      ANDROID_API: ${{ inputs.android_api }}
+      CLING_REF: ${{ inputs.cling_ref }}
+      LLVM_REF: ${{ inputs.llvm_ref }}
+      CMAKE_VERSION_INPUT: ${{ inputs.cmake_version }}
+      NDK_HOME: ${{ github.workspace }}/android-ndk-r30
+      NDK_HOST: linux-x86_64
+      BUILD_ROOT: ${{ github.workspace }}/build
+      OUT_DIR: ${{ github.workspace }}/cling-cmake-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
+          for dir in \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/share/powershell; do
+            if [[ -d "${dir}" ]]; then
+              sudo rm -rf "${dir}"
+            fi
+          done
+          df -h
+
+      - name: Configure swap
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 6G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git wget unzip python3 jq \
+            pkg-config ca-certificates file binutils xz-utils libssl-dev \
+            zlib1g-dev libzstd-dev liblzma-dev
+
+      - name: Resolve Cling, LLVM, and CMake versions
+        id: resolve-versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${LLVM_REF}"
+
+          RESOLVED_CLING_REF="${CLING_REF}"
+          if [[ "${RESOLVED_CLING_REF}" == "latest" ]]; then
+            RESOLVED_CLING_REF="$(curl -fsSL https://api.github.com/repos/root-project/cling/releases/latest | jq -r '.tag_name // empty')"
+            if [[ -z "${RESOLVED_CLING_REF}" ]]; then
+              RESOLVED_CLING_REF="$(git ls-remote --tags --sort=-v:refname https://github.com/root-project/cling.git | head -n 1 | awk -F/ '{print $NF}' | sed 's/\^{}//')"
+            fi
+            test -n "${RESOLVED_CLING_REF}"
+          fi
+
+          RESOLVED_CMAKE_VER="${CMAKE_VERSION_INPUT}"
+          if [[ "${RESOLVED_CMAKE_VER}" == "latest" ]]; then
+            LATEST_TAG="$(curl -fsSL https://api.github.com/repos/Kitware/CMake/releases/latest | jq -r '.tag_name // empty')"
+            RESOLVED_CMAKE_VER="${LATEST_TAG#v}"
+            test -n "${RESOLVED_CMAKE_VER}"
+          else
+            RESOLVED_CMAKE_VER="${RESOLVED_CMAKE_VER#v}"
+          fi
+
+          SAFE_CLING_REF="$(printf '%s' "${RESOLVED_CLING_REF}" | tr '/\\:*?"<> ' '_')"
+          SAFE_CMAKE_VER="$(printf '%s' "${RESOLVED_CMAKE_VER}" | tr '/\\:*?"<> ' '_')"
+          ARTIFACT_NAME="cling-cmake-arm64-${SAFE_CLING_REF}-cmake-${SAFE_CMAKE_VER}-api-${ANDROID_API}"
+          ARCHIVE_NAME="cling-cmake-arm64-${SAFE_CLING_REF}-cmake-${SAFE_CMAKE_VER}-api-${ANDROID_API}.tar.xz"
+          CMAKE_DIR_NAME="CMake-${RESOLVED_CMAKE_VER}"
+          CMAKE_OUT_DIR="${OUT_DIR}/${CMAKE_DIR_NAME}"
+          BUILD_JOBS="$(nproc)"
+          test "${BUILD_JOBS}" -ge 1
+
+          {
+            echo "RESOLVED_CLING_REF=${RESOLVED_CLING_REF}"
+            echo "RESOLVED_CMAKE_VER=${RESOLVED_CMAKE_VER}"
+            echo "ARTIFACT_NAME=${ARTIFACT_NAME}"
+            echo "ARCHIVE_NAME=${ARCHIVE_NAME}"
+            echo "CMAKE_DIR_NAME=${CMAKE_DIR_NAME}"
+            echo "CMAKE_OUT_DIR=${CMAKE_OUT_DIR}"
+            echo "BUILD_JOBS=${BUILD_JOBS}"
+            echo "CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}"
+          } >> "${GITHUB_ENV}"
+
+          {
+            echo "artifact_name=${ARTIFACT_NAME}"
+            echo "archive_name=${ARCHIVE_NAME}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Cling ref: ${RESOLVED_CLING_REF}"
+          echo "LLVM ref: ${LLVM_REF}"
+          echo "CMake ver: ${RESOLVED_CMAKE_VER}"
+          echo "Artifact name: ${ARTIFACT_NAME}"
+          echo "Archive name: ${ARCHIVE_NAME}"
+          echo "CMake out dir: ${CMAKE_OUT_DIR}"
+          echo "CPU jobs: ${BUILD_JOBS}"
+
+      - name: Cache Android NDK r30
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK_HOME }}
+          key: ${{ runner.os }}-${{ runner.arch }}-android-ndk-${{ env.NDK_VERSION }}-${{ env.NDK_SHA1 }}
+
+      - name: Download and verify Android NDK r30
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q --show-progress \
+            https://dl.google.com/android/repository/android-ndk-r30-linux.zip \
+            -O android-ndk-r30-linux.zip
+          echo "${NDK_SHA1}  android-ndk-r30-linux.zip" | sha1sum -c -
+          unzip -q android-ndk-r30-linux.zip -d "${GITHUB_WORKSPACE}"
+          rm -f android-ndk-r30-linux.zip
+          test -x "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/clang"
+
+      - name: Cross-build and verify CMake for Android ARM64 (first)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake"
+          READELF="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-readelf"
+          test -f "${TOOLCHAIN_FILE}"
+          test -x "${READELF}"
+
+          mkdir -p "${BUILD_ROOT}" "${OUT_DIR}"
+          CMAKE_TARBALL="cmake-${RESOLVED_CMAKE_VER}.tar.gz"
+          CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${RESOLVED_CMAKE_VER}/${CMAKE_TARBALL}"
+          CMAKE_SRC="${BUILD_ROOT}/cmake-${RESOLVED_CMAKE_VER}"
+          CMAKE_BUILD="${BUILD_ROOT}/android-cmake"
+          CMAKE_STAGE="${BUILD_ROOT}/stage-cmake"
+          CMAKE_BUILD_LOG="${BUILD_ROOT}/cmake-build.log"
+
+          rm -rf "${CMAKE_SRC}" "${CMAKE_BUILD}" "${CMAKE_STAGE}" "${CMAKE_OUT_DIR}" "${CMAKE_BUILD_LOG}"
+          mkdir -p "${CMAKE_STAGE}" "${CMAKE_OUT_DIR}"
+
+          wget -q --show-progress "${CMAKE_URL}" -O "${BUILD_ROOT}/${CMAKE_TARBALL}"
+          tar -xzf "${BUILD_ROOT}/${CMAKE_TARBALL}" -C "${BUILD_ROOT}"
+          rm -f "${BUILD_ROOT}/${CMAKE_TARBALL}"
+          test -d "${CMAKE_SRC}"
+
+          ANDROID_INC_DIR="${CMAKE_SRC}/Utilities/cmlibarchive/contrib/android/include"
+          REPO_ANDROID_LF="${GITHUB_WORKSPACE}/android/include/android_lf.h"
+          mkdir -p "${ANDROID_INC_DIR}"
+          if [[ ! -f "${ANDROID_INC_DIR}/android_lf.h" ]]; then
+            test -f "${REPO_ANDROID_LF}"
+            cp -f "${REPO_ANDROID_LF}" "${ANDROID_INC_DIR}/android_lf.h"
+          fi
+
+          COVER_C="${CMAKE_SRC}/Utilities/cmzstd/lib/dictBuilder/cover.c"
+          if [[ -f "${COVER_C}" ]]; then
+            python3 "${GITHUB_WORKSPACE}/scripts/patch_cover.py" "${COVER_C}"
+          fi
+
+          # Android Bionic no declara pthread_setaffinity_np hasta API 36.
+          # Para API 29-35, libuv debe usar sched_setaffinity + pthread_gettid_np.
+          LIBUV_PROCESS_C="${CMAKE_SRC}/Utilities/cmlibuv/src/unix/process.c"
+          test -f "${LIBUV_PROCESS_C}"
+          python3 "${GITHUB_WORKSPACE}/scripts/patch_android_libuv.py" "${LIBUV_PROCESS_C}"
+          echo "=== libuv Android affinity patch aplicado ==="
+          grep -n -C 4 -E 'pthread_gettid_np|sched_setaffinity|pthread_setaffinity_np' "${LIBUV_PROCESS_C}" || true
+
+          cmake -S "${CMAKE_SRC}" -B "${CMAKE_BUILD}" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_C_FLAGS="-D_GNU_SOURCE" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${CMAKE_STAGE}" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_BUILD_LTO=OFF \
+            -DCMAKE_USE_OPENSSL=OFF
+
+          if ! cmake --build "${CMAKE_BUILD}" \
+            --target cmake ctest \
+            --parallel "${BUILD_JOBS}" 2>&1 | tee "${CMAKE_BUILD_LOG}"; then
+            echo "=== Error detallado de compilacion de CMake ==="
+            grep -n -C 8 -E "error:|cover\.c|core\.c|process\.c|pthread_setaffinity_np|sched_setaffinity" "${CMAKE_BUILD_LOG}" | tail -n 160 || tail -n 160 "${CMAKE_BUILD_LOG}"
+            if [[ -f "${COVER_C}" ]]; then
+              echo "=== Contexto de Utilities/cmzstd/lib/dictBuilder/cover.c (lineas 280-360) ==="
+              nl -ba "${COVER_C}" | sed -n '280,360p'
+            fi
+            if [[ -f "${CMAKE_SRC}/Utilities/cmlibuv/src/unix/process.c" ]]; then
+              echo "=== Contexto de afinidad Android en Utilities/cmlibuv/src/unix/process.c ==="
+              grep -n -C 12 -E 'pthread_setaffinity_np|pthread_gettid_np|sched_setaffinity' \
+                "${CMAKE_SRC}/Utilities/cmlibuv/src/unix/process.c" || true
+            fi
+            exit 1
+          fi
+
+          cmake --install "${CMAKE_BUILD}"
+          cp -a "${CMAKE_STAGE}/." "${CMAKE_OUT_DIR}/"
+          test -x "${CMAKE_OUT_DIR}/bin/cmake"
+          test -x "${CMAKE_OUT_DIR}/bin/ctest"
+
+          CMAKE_SHARE_DIR="$(find "${CMAKE_OUT_DIR}/share" -maxdepth 1 -type d -name 'cmake-*' | head -n 1)"
+          test -n "${CMAKE_SHARE_DIR}"
+          test -d "${CMAKE_SHARE_DIR}/Modules"
+          test -f "${CMAKE_SHARE_DIR}/Modules/CMake.cmake"
+
+          for bin_path in "${CMAKE_OUT_DIR}/bin/cmake" "${CMAKE_OUT_DIR}/bin/ctest"; do
+            "${READELF}" -h "${bin_path}" | grep -q 'Machine:.*AArch64'
+            DYN_INFO="$("${READELF}" -d "${bin_path}")"
+            echo "=== ELF dynamic entries for ${bin_path} ==="
+            echo "${DYN_INFO}" | grep -E '\((NEEDED|RPATH|RUNPATH)\)' || true
+            if echo "${DYN_INFO}" | grep -qE 'NEEDED.*\[(libc\.so\.6|libstdc\+\+\.so\.6|libm\.so\.6)\]'; then
+              echo "ERROR: ${bin_path} links against host glibc/libstdc++ libraries" >&2
+              exit 1
+            fi
+            if ! echo "${DYN_INFO}" | grep -qE '\((RPATH|RUNPATH)\).*\$ORIGIN/\.\./lib'; then
+              echo "ERROR: ${bin_path} missing \$ORIGIN/../lib in RPATH/RUNPATH" >&2
+              exit 1
+            fi
+          done
+
+          rm -rf "${CMAKE_SRC}" "${CMAKE_BUILD}" "${CMAKE_STAGE}" "${CMAKE_BUILD_LOG}"
+
+      - name: Clone LLVM (Cling fork) and Cling sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${BUILD_ROOT}" "${OUT_DIR}"
+          git clone --depth 1 --branch "${LLVM_REF}" \
+            https://github.com/root-project/llvm-project.git "${BUILD_ROOT}/llvm-project"
+          git clone --depth 1 --branch "${RESOLVED_CLING_REF}" \
+            https://github.com/root-project/cling.git "${BUILD_ROOT}/cling"
+
+      - name: Build host TableGen and llvm-config tools for Cling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S "${BUILD_ROOT}/llvm-project/llvm" -B "${BUILD_ROOT}/host" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS='clang' \
+            -DLLVM_EXTERNAL_PROJECTS='cling' \
+            -DLLVM_EXTERNAL_CLING_SOURCE_DIR="${BUILD_ROOT}/cling" \
+            -DLLVM_TARGETS_TO_BUILD='X86;AArch64' \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLING_INCLUDE_TESTS=OFF
+
+          cmake --build "${BUILD_ROOT}/host" \
+            --target llvm-tblgen clang-tblgen llvm-config \
+            --parallel "${BUILD_JOBS}"
+
+      - name: Cross-build Cling for Android ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_FILE="${NDK_HOME}/build/cmake/android.toolchain.cmake"
+          CLING_STAGE="${BUILD_ROOT}/stage-cling"
+
+          cmake -S "${BUILD_ROOT}/llvm-project/llvm" -B "${BUILD_ROOT}/android-cling" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_ALLOW_UNDEFINED_SYMBOLS=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${CLING_STAGE}" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN/../lib' \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DLLVM_ENABLE_PROJECTS='clang' \
+            -DLLVM_EXTERNAL_PROJECTS='cling' \
+            -DLLVM_EXTERNAL_CLING_SOURCE_DIR="${BUILD_ROOT}/cling" \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_HOST_TRIPLE=aarch64-unknown-linux-android \
+            -DLLVM_DEFAULT_TARGET_TRIPLE="aarch64-linux-android${ANDROID_API}" \
+            -DLLVM_NATIVE_TOOL_DIR="${BUILD_ROOT}/host/bin" \
+            -DLLVM_CONFIG_PATH="${BUILD_ROOT}/host/bin/llvm-config" \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DLLVM_ENABLE_PIC=ON \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_BUILD_EXAMPLES=OFF \
+            -DCLING_INCLUDE_TESTS=OFF \
+            -DLLVM_ENABLE_ZLIB=ON \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_FFI=OFF
+
+          cmake --build "${BUILD_ROOT}/android-cling" \
+            --target cling \
+            --parallel "${BUILD_JOBS}"
+
+          cmake --install "${BUILD_ROOT}/android-cling" --component cling || \
+            cmake --install "${BUILD_ROOT}/android-cling"
+
+          mkdir -p "${OUT_DIR}/cling/bin" "${OUT_DIR}/cling/lib" "${OUT_DIR}/cling/include"
+          cp -a "${CLING_STAGE}/bin/cling" "${OUT_DIR}/cling/bin/"
+          cp -a "${CLING_STAGE}/lib/." "${OUT_DIR}/cling/lib/"
+          if [[ -d "${CLING_STAGE}/include/cling" ]]; then
+            cp -a "${CLING_STAGE}/include/cling" "${OUT_DIR}/cling/include/"
+          fi
+
+      - name: Bundle libc++_shared.so, strip ARM64 binaries, and verify ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIBCXX_SHARED="$(find "${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/sysroot/usr/lib/aarch64-linux-android" \
+            -name 'libc++_shared.so' | head -n 1)"
+          test -n "${LIBCXX_SHARED}"
+          cp -f "${LIBCXX_SHARED}" "${OUT_DIR}/cling/lib/"
+          mkdir -p "${CMAKE_OUT_DIR}/lib"
+          cp -f "${LIBCXX_SHARED}" "${CMAKE_OUT_DIR}/lib/"
+
+          LLVM_STRIP="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-strip"
+          READELF="${NDK_HOME}/toolchains/llvm/prebuilt/${NDK_HOST}/bin/llvm-readelf"
+
+          while IFS= read -r -d '' file_path; do
+            if [[ ! -L "${file_path}" ]] && file -b "${file_path}" | grep -q '^ELF'; then
+              "${LLVM_STRIP}" --strip-unneeded "${file_path}"
+            fi
+          done < <(find "${OUT_DIR}" -type f \( -perm -0100 -o -name '*.so' -o -name '*.so.*' \) -print0)
+
+          test -x "${OUT_DIR}/cling/bin/cling"
+          test -x "${CMAKE_OUT_DIR}/bin/cmake"
+          "${READELF}" -h "${OUT_DIR}/cling/bin/cling" | grep -q 'Machine:.*AArch64'
+          "${READELF}" -h "${CMAKE_OUT_DIR}/bin/cmake" | grep -q 'Machine:.*AArch64'
+
+          cat <<-EOF > "${OUT_DIR}/BUILD-INFO.txt"
+          Cling ref: ${RESOLVED_CLING_REF}
+          LLVM ref: ${LLVM_REF}
+          CMake ver: ${RESOLVED_CMAKE_VER}
+          CMake dir: ${CMAKE_DIR_NAME}
+          Android API: ${ANDROID_API}
+          ABI: arm64-v8a
+          EOF
+
+      - name: Archive Cling and CMake artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${BUILD_ROOT}"
+          cd "${OUT_DIR}"
+          XZ_OPT='-9e -T0' tar \
+            --sort=name \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -cJf "${GITHUB_WORKSPACE}/${ARCHIVE_NAME}" .
+          ls -lh "${GITHUB_WORKSPACE}/${ARCHIVE_NAME}"
+
+      - name: Upload Cling & CMake artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve-versions.outputs.artifact_name }}
+          path: ${{ steps.resolve-versions.outputs.archive_name }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 31
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
+          ### Build Summary (Android ARM64)
+          - **Cling ref:** \`${RESOLVED_CLING_REF:-${CLING_REF}}\`
+          - **LLVM ref:** \`${LLVM_REF}\`
+          - **CMake version:** \`${RESOLVED_CMAKE_VER:-${CMAKE_VERSION_INPUT}}\` (dir: \`${CMAKE_DIR_NAME:-N/A}\`)
+          - **Android API:** \`android-${ANDROID_API}\`
+          - **Artifact:** \`${ARTIFACT_NAME:-N/A}\` (\`${ARCHIVE_NAME:-N/A}\`)
+          EOF
